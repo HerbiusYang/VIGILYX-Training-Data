@@ -1,0 +1,19 @@
+# macOS metadata
+.DS_Store
+._*
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.coverage
+htmlcov/
+
+# Local credentials
+.env
+.env.*
+!.env.example
