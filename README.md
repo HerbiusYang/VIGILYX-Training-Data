@@ -1,6 +1,6 @@
 # VIGILYX-Training Data
 
-[GitHub](https://github.com/HerbiusYang/VIGILYX-Training-Data) · [MIT License](LICENSE) · [语料格式](realistic-email-threat-corpus/references/schema.md)
+[GitHub](https://github.com/HerbiusYang/VIGILYX-Training-Data) · [MIT License](LICENSE) · [语料格式](realistic-email-threat-corpus/references/schema.md) · [发布图片与配文](docs/launch.md)
 
 用于邮件安全检测、分类与防御训练的语料项目，包含 JSON 语料、本地查看器，以及指导智能体检索、改编和验收邮件的 Skill。覆盖个人消费者与工作场景中的钓鱼、身份冒用、BPC（业务流程篡改）和 BEC（商业邮件诈骗），并支持正常对照与证据不足时的独立复核。
 
