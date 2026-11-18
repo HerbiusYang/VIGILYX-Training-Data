@@ -1,12 +1,12 @@
 # VIGILYX-Training Data
 
-[GitHub](https://github.com/HerbiusYang/VIGILYX-Training-Data) · [MIT License](LICENSE) · [语料格式](realistic-email-threat-corpus/references/schema.md) · [发布图片与配文](docs/launch.md)
+[GitHub](https://github.com/HerbiusYang/VIGILYX-Training-Data) · [MIT License](LICENSE) · [语料格式](realistic-email-threat-corpus/references/schema.md)
 
 用于邮件安全检测、分类与防御训练的语料项目，包含 JSON 语料、本地查看器，以及指导智能体检索、改编和验收邮件的 Skill。覆盖个人消费者与工作场景中的钓鱼、身份冒用、BPC（业务流程篡改）和 BEC（商业邮件诈骗），并支持正常对照与证据不足时的独立复核。
 
 默认以中国大陆、自然中文和人民币场景为主。根据真实活动、业务流程或已披露风险机制改编的邮件，不代表实际截获的原始邮件；既有记录也不因收录在本项目中就自动符合最新规则。
 
-当前包含 **5,078 条**样本：4,213 条恶意、865 条正常；中文 4,840 条、英文 120 条、中英双语 118 条。来源类型为 4,704 条 `source-adapted` 与 374 条历史 `synthetic`。这是语料数量与元数据统计，不代表模型检测成绩或对每条来源的重新认证。
+当前包含 **5,819 条**样本：4,876 条恶意、943 条正常；中文 5,580 条、英文 121 条、中英双语 118 条。来源类型为 5,445 条 `source-adapted` 与 374 条历史 `synthetic`。这是语料数量与元数据统计，不代表模型检测成绩或对每条来源的重新认证。
 
 ## 目录
 
@@ -85,7 +85,7 @@ python3 realistic-email-threat-corpus/scripts/validate_records.py data/corpus.js
 
 ```bash
 python3 realistic-email-threat-corpus/scripts/validate_records.py new_records.json \
-  --strict --require-cn-context --require-grounding --require-raw-urls
+  --strict --require-cn-context --require-grounding --require-raw-urls --require-render --require-current-year
 ```
 
 只有明确要求整批详细正文时才加 `--require-detailed`；`--balanced` 用于要求标签均衡的批次，不是默认要求。`--require-raw-urls` 检查新记录没有沿用整条 URL 占位符，不要求每封邮件都含链接。校验器不会访问邮件链接或核实来源网页。

@@ -3,7 +3,7 @@
 
 Usage: python3 validate_records.py corpus.json [--strict] [--balanced]
        [--require-detailed] [--require-cn-context] [--require-grounding] [--require-raw-urls]
-       [--labels malicious,benign] [--extra-codes code_a,code_b]
+       [--require-render] [--require-current-year] [--labels malicious,benign] [--extra-codes code_a,code_b]
 
 Records with schema_version="2.0" always receive v2 checks. --strict also
 rejects legacy records. Exit status 1 means errors; warnings remain review items.
@@ -16,6 +16,15 @@ V2 preserves literal URLs and domains; personal e-mail addresses remain masked.
 --require-raw-urls rejects legacy [URL_n] placeholders, not messages without links.
 URLs are never fetched. URL privacy checks decode common percent escapes twice;
 names, credentials, encoded payloads and source authenticity still require review.
+A record-level "render" object declares fictional people/organizations and the
+mailbox relationships that render_records.py turns into realistic surface text.
+--require-render requires it plus sender/recipient mailboxes and sent_at values.
+--require-current-year checks newly composed mail from January 1 through the
+local run date. Originals retain their recorded dates.
+Sources with origin "user_supplied" (a supplied original email) need no URL, and
+retrieval may be omitted when every source in the record is user supplied.
+provenance.detector_feedback marks a real false positive/negative; its label must
+be the reviewed truth, not the detector's verdict, which stays out of input.
 
 Detailed body metric: count only text before the first recognized quoted block.
 Remove common standalone greetings, closing/signature/footer blocks, placeholders,
@@ -135,6 +144,21 @@ NATURAL_CURRENCY_CODE_RE = re.compile(
     + r"|(?<![A-Za-z0-9])" + MONEY_NUMBER + MONEY_GAP + r"(?:USD|CNY|RMB)(?![A-Za-z])", re.I,
 )
 DOLLAR_AMOUNT_RE = re.compile(r"\$\s*[+-]?" + MONEY_NUMBER)
+# Rendering contract: tokens in canonical input name a person/org/mailbox whose
+# surface form is chosen later by render_records.py, independently of labels.
+RENDER_TOKEN_RE = re.compile(r"\[([A-Z][A-Z_]*)_([1-9][0-9]*)\]")
+TOKEN_OWNER = {"PERSON": "PERSON", "SURNAME": "PERSON", "GIVEN": "PERSON", "SIGNATURE": "PERSON",
+               "ORG": "ORG", "ORGSHORT": "ORG", "DOMAIN": "ORG", "LOOKALIKE": "ORG",
+               "EMAIL": "EMAIL", "USER": "USER", "PHONE": "PHONE"}
+RENDER_SECTIONS = {"orgs": "ORG", "people": "PERSON", "mailboxes": "EMAIL", "users": "USER", "phones": "PHONE"}
+ORG_KINDS = {"fictional", "real"}
+ORG_TYPES = {"company", "school", "hospital"}
+MAILBOX_DOMAINS = {"org", "freemail", "lookalike", "external", "observed"}
+PHONE_KINDS = {"extension", "landline", "mobile", "hotline"}
+SOURCE_ORIGINS = {"web", "user_supplied"}
+FEEDBACK_OUTCOMES = {"false_positive", "false_negative"}
+LOCAL_PART_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,40}[a-z0-9])?")
+HOSTNAME_RE = re.compile(r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}")
 
 
 class Report:
@@ -336,7 +360,7 @@ def numeric_findings(text, allowed_identifiers=(), strict_numbers=False, in_url=
 
 def lang_counts(texts):
     joined = "\n".join(texts)
-    for pattern in (URL_TEXT_RE, EMAIL_RE, DOMAIN_RE, REDACTED_RE, TOKEN_RE, SYN_ID_RE):
+    for pattern in (URL_TEXT_RE, EMAIL_RE, DOMAIN_RE, REDACTED_RE, ANY_TOKEN_RE, SYN_ID_RE):
         joined = pattern.sub(" ", joined)
     return len(CJK_RE.findall(joined)), len(LATIN_WORD_RE.findall(joined))
 
@@ -413,7 +437,7 @@ def check_sender(rid, where, sender, rep, v2=False, address_only=False):
         rep.error(rid, f"{where} must be a string or an object")
 
 
-def check_message(message, rid, where, rep, v2, current=False):
+def check_message(message, rid, where, rep, v2, current=False, require_sent_at=False, as_of=None):
     if not isinstance(message, dict):
         rep.error(rid, f"{where} must be an object")
         return {}, ["", ""]
@@ -441,10 +465,15 @@ def check_message(message, rid, where, rep, v2, current=False):
             if not isinstance(stamp, str) or "T" not in stamp:
                 raise ValueError("timestamp needs an ISO date and time")
             parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-            if v2 and parsed.tzinfo is None:
-                raise ValueError("v2 timestamp needs a time zone")
+            if (v2 or as_of is not None) and parsed.tzinfo is None:
+                raise ValueError("timestamp needs a time zone")
+            if as_of is not None and (parsed.year != as_of.year or parsed.date() > as_of):
+                rep.error(rid, f"{where}.sent_at must be between {as_of.year}-01-01 and {as_of} "
+                               f"under --require-current-year (got {parsed.date()})")
         except ValueError as exc:
             rep.error(rid, f"{where}.sent_at invalid ISO timestamp: {exc}")
+    elif require_sent_at or as_of is not None:
+        rep.error(rid, f"{where}.sent_at is required")
     if "attachments" in message:
         attachments = message["attachments"]
         if not isinstance(attachments, list):
@@ -509,9 +538,16 @@ def check_provenance(prov, rid, rep):
             if not isinstance(source, dict):
                 rep.error(rid, f"{where} must be an object")
                 continue
-            for key in ("id", "title", "publisher", "url", "accessed_at", "supports"):
+            origin = source.get("origin", "web")
+            if not isinstance(origin, str) or origin not in SOURCE_ORIGINS:
+                rep.error(rid, f"{where}.origin must be one of {sorted(SOURCE_ORIGINS)} when present")
+            # A supplied original email has no public address; it is still cited by ID.
+            required = ("id", "title", "publisher", "accessed_at", "supports") + (() if origin == "user_supplied" else ("url",))
+            for key in required:
                 if not nonempty(source.get(key)):
                     rep.error(rid, f"{where}.{key} must be a non-empty string")
+            if origin == "user_supplied" and "url" in source and not nonempty(source.get("url")):
+                rep.error(rid, f"{where}.url must be a non-empty string when present")
             sid = source.get("id")
             if nonempty(sid):
                 if sid in source_ids:
@@ -679,7 +715,7 @@ def check_cn_context(record, rid, rep, require=False):
         rep.error(rid, "Chinese input must write dollar amounts with 美元/美金 rather than a dollar sign")
 
 
-def check_grounding(record, prov, rid, rep, require=False):
+def check_grounding(record, prov, rid, rep, require=False, as_of=None):
     """Validate declared provenance links, not source truth or complete support."""
     kind = prov.get("kind")
     active = require or "grounding" in prov or kind == "source-adapted"
@@ -719,6 +755,11 @@ def check_grounding(record, prov, rid, rep, require=False):
     for field in ("region", "period", "setting"):
         if not isinstance(context, dict) or not nonempty(context.get(field)):
             rep.error(rid, f"provenance.grounding.context.{field} must be a non-empty string")
+    if as_of is not None and isinstance(context, dict) and nonempty(context.get("period")):
+        scenario_year = re.search(r"(?<!\d)[0-9]{4}(?!\d)", context["period"])
+        if not scenario_year or int(scenario_year.group()) != as_of.year:
+            rep.error(rid, f"provenance.grounding.context.period must give the scenario year {as_of.year} first "
+                           "under --require-current-year")
     material = grounding.get("source_material")
     material_source_ids = set()
     if not isinstance(material, dict):
@@ -734,7 +775,11 @@ def check_grounding(record, prov, rid, rep, require=False):
             if not material_source_ids:
                 rep.error(rid, "source_material must reference at least one material-role source; entity/context/policy-only pages do not qualify")
     retrieval = grounding.get("retrieval")
-    if not isinstance(retrieval, dict):
+    supplied_only = (isinstance(sources, list) and bool(sources)
+                     and all(isinstance(source, dict) and source.get("origin") == "user_supplied" for source in sources))
+    if retrieval is None and supplied_only:
+        pass  # Nothing was searched; a fabricated query log would be worse than none.
+    elif not isinstance(retrieval, dict):
         rep.error(rid, "provenance.grounding.retrieval must be an object")
     else:
         queries = retrieval.get("queries")
@@ -846,7 +891,200 @@ def check_grounding(record, prov, rid, rep, require=False):
         rep.error(rid, f"grounding requires a body mapping to a material-role source listed in source_material.source_ids for {path}")
 
 
-def check_record(rec, idx, labels, codes, rep, seen, strict=False, require_detailed=False, require_cn_context=False, require_grounding=False, require_raw_urls=False):
+def input_token_uses(inp):
+    """Return (token kind, declaring key) pairs, e.g. ('SURNAME', 'PERSON_2')."""
+    uses = set()
+    for text in strings(inp):
+        for kind, index in RENDER_TOKEN_RE.findall(text):
+            if kind in TOKEN_OWNER:
+                uses.add((kind, f"{TOKEN_OWNER[kind]}_{index}"))
+    return uses
+
+
+def parse_stamp(stamp):
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00")) if isinstance(stamp, str) and "T" in stamp else None
+    except ValueError:
+        return None
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
+
+
+def check_render(record, prov, rid, rep, require=False):
+    """Validate declared render relationships; surface names are chosen only by the renderer."""
+    render = record.get("render")
+    if render is None:
+        if require:
+            rep.error(rid, "--require-render requires a render object declaring people, organizations and mailboxes")
+        return
+    if not isinstance(render, dict):
+        rep.error(rid, "render must be an object")
+        return
+    for key in sorted(set(render) - set(RENDER_SECTIONS) - {"style"}):
+        rep.error(rid, f"render.{key} is not a defined render section")
+    if "style" in render and not isinstance(render["style"], dict):
+        rep.error(rid, "render.style must be an object when present")
+    sections = {}
+    for section, prefix in RENDER_SECTIONS.items():
+        value = render.get(section, {})
+        if not isinstance(value, dict):
+            rep.error(rid, f"render.{section} must be an object keyed by {prefix}_n")
+            value = {}
+        sections[section] = {}
+        for key, item in value.items():
+            if not re.fullmatch(prefix + r"_[1-9][0-9]*", key):
+                rep.error(rid, f"render.{section} key '{key}' must look like {prefix}_n")
+            elif not isinstance(item, dict):
+                rep.error(rid, f"render.{section}.{key} must be an object")
+            else:
+                sections[section][key] = item
+    orgs, people, mailboxes = sections["orgs"], sections["people"], sections["mailboxes"]
+    sources = prov.get("sources") if isinstance(prov.get("sources"), list) else []
+    source_ids = {source.get("id") for source in sources if isinstance(source, dict)}
+    entities = prov.get("entities") if isinstance(prov.get("entities"), list) else []
+    entity_names = {entity.get("name") for entity in entities if isinstance(entity, dict)}
+
+    def require_sources(where, item):
+        refs = item.get("source_ids")
+        if not isinstance(refs, list) or not refs or any(not nonempty(ref) or ref not in source_ids for ref in refs):
+            rep.error(rid, f"{where}.source_ids must reference existing provenance.sources IDs")
+
+    def optional_strings(where, item, keys):
+        for key in keys:
+            if key in item and not nonempty(item[key]):
+                rep.error(rid, f"{where}.{key} must be a non-empty string when present")
+
+    def check_enum(where, item, key, allowed):
+        if key in item and (not isinstance(item[key], str) or item[key] not in allowed):
+            rep.error(rid, f"{where}.{key} must be one of {sorted(allowed)}")
+
+    for key, org in orgs.items():
+        where = f"render.orgs.{key}"
+        kind = org.get("kind")
+        if not isinstance(kind, str) or kind not in ORG_KINDS:
+            rep.error(rid, f"{where}.kind must be one of {sorted(ORG_KINDS)}")
+        elif kind == "fictional":
+            for field in ("region", "industry"):
+                if not nonempty(org.get(field)):
+                    rep.error(rid, f"{where}.{field} is required for a fictional organization")
+            check_enum(where, org, "org_type", ORG_TYPES)
+            optional_strings(where, org, ("suffix",))
+            for field in ("name", "domain", "source_ids"):
+                if field in org:
+                    rep.error(rid, f"{where}.{field}: fictional organizations get names and domains from the renderer")
+        else:
+            if not nonempty(org.get("name")) or org["name"] not in entity_names:
+                rep.error(rid, f"{where}.name must exactly match a provenance.entities name for a real organization")
+            require_sources(where, org)
+            if "domain" in org and (not isinstance(org["domain"], str) or not HOSTNAME_RE.fullmatch(org["domain"])):
+                rep.error(rid, f"{where}.domain must be a lowercase hostname")
+    for key, person in people.items():
+        where = f"render.people.{key}"
+        if "org" in person and (not isinstance(person["org"], str) or person["org"] not in orgs):
+            rep.error(rid, f"{where}.org must reference a render.orgs key")
+        check_enum(where, person, "gender", {"m", "f"})
+        check_enum(where, person, "device", {"desktop", "mobile"})
+        optional_strings(where, person, ("dept", "title"))
+        if "name" in person:
+            rep.error(rid, f"{where}.name: person names are chosen by the renderer, never stored")
+    for key, box in mailboxes.items():
+        where = f"render.mailboxes.{key}"
+        owner, domain = box.get("owner"), box.get("domain")
+        owner = owner if isinstance(owner, str) else None
+        if owner not in people and owner not in orgs:
+            rep.error(rid, f"{where}.owner must reference a render.people or render.orgs key")
+        if not isinstance(domain, str) or domain not in MAILBOX_DOMAINS:
+            rep.error(rid, f"{where}.domain must be one of {sorted(MAILBOX_DOMAINS)}")
+        if "local" in box and (not isinstance(box["local"], str) or not LOCAL_PART_RE.fullmatch(box["local"])):
+            rep.error(rid, f"{where}.local must be a lowercase role-style local part such as 'hr' or 'noreply'")
+        if "provider" in box and (domain != "freemail" or not isinstance(box["provider"], str)
+                                  or not HOSTNAME_RE.fullmatch(box["provider"])):
+            rep.error(rid, f"{where}.provider is a hostname allowed only for freemail mailboxes")
+        if "value" in box:
+            if not isinstance(box["value"], str) or not HOSTNAME_RE.fullmatch(box["value"]):
+                rep.error(rid, f"{where}.value must be a lowercase hostname")
+            require_sources(where, box)
+        elif domain == "observed":
+            rep.error(rid, f"{where}: observed mailboxes require the observed domain as value")
+        org_key = owner if owner in orgs else people[owner].get("org") if owner in people else None
+        org_key = org_key if isinstance(org_key, str) else None
+        if domain in ("org", "lookalike"):
+            org = orgs.get(org_key)
+            if org is None:
+                rep.error(rid, f"{where}: domain '{domain}' needs an owner that belongs to a render.orgs entry")
+            elif org.get("kind") == "real" and domain == "org" and not nonempty(org.get("domain")):
+                rep.error(rid, f"{where}: a real organization's mailbox needs that organization's sourced domain")
+            elif org.get("kind") == "real" and domain == "lookalike" and "value" not in box:
+                rep.error(rid, f"{where}: a lookalike of a real organization must be a sourced indicator value, never generated")
+    for key, user in sections["users"].items():
+        if "owner" in user and (not isinstance(user["owner"], str) or user["owner"] not in people):
+            rep.error(rid, f"render.users.{key}.owner must reference a render.people key")
+    for key, phone in sections["phones"].items():
+        check_enum(f"render.phones.{key}", phone, "kind", PHONE_KINDS)
+        if "owner" in phone and (not isinstance(phone["owner"], str) or (phone["owner"] not in people and phone["owner"] not in orgs)):
+            rep.error(rid, f"render.phones.{key}.owner must reference a render.people or render.orgs key")
+    inp = record.get("input") if isinstance(record.get("input"), dict) else {}
+    section_of = {prefix: section for section, prefix in RENDER_SECTIONS.items()}
+    for kind, key in sorted(input_token_uses(inp)):
+        prefix = key.split("_")[0]
+        if prefix in ("USER", "PHONE"):
+            continue  # Optional declarations; the renderer has neutral defaults.
+        if key not in sections[section_of[prefix]]:
+            rep.error(rid, f"input uses [{kind}_{key.split('_')[1]}] but render.{section_of[prefix]} does not declare {key}")
+        elif prefix == "ORG" and orgs[key].get("kind") == "real":
+            if kind == "LOOKALIKE":
+                rep.error(rid, f"[LOOKALIKE_{key.split('_')[1]}] cannot be generated for a real organization; use a sourced mailbox or URL value")
+            elif kind == "DOMAIN" and not nonempty(orgs[key].get("domain")):
+                rep.error(rid, f"[DOMAIN_{key.split('_')[1]}] needs the real organization's sourced domain")
+    if not require:
+        return
+    history = inp.get("history") if isinstance(inp.get("history"), list) else []
+    messages = [(f"input.history[{i}]", message) for i, message in enumerate(history)]
+    messages.append(("input.current_email", inp.get("current_email")))
+    stamps = []
+    for where, message in messages:
+        if not isinstance(message, dict):
+            continue
+        sender = message.get("from")
+        if not isinstance(sender, dict) or not isinstance(sender.get("address"), str) or not EMAIL_TOKEN_RE.fullmatch(sender["address"]):
+            rep.error(rid, f"{where}.from must be an object with an [EMAIL_n] address under --require-render")
+        stamps.append(parse_stamp(message.get("sent_at")))
+    current = inp.get("current_email")
+    if isinstance(current, dict) and (not isinstance(current.get("to"), list) or not current["to"]):
+        rep.error(rid, "input.current_email.to must list at least one recipient under --require-render")
+    if all(stamps) and any(later < earlier for earlier, later in zip(stamps, stamps[1:])):
+        rep.error(rid, "message sent_at values must run in chronological order with the current email last")
+
+
+def check_feedback(record, prov, rid, rep):
+    """A real detector miss (false positive/negative) recorded outside classifier input."""
+    feedback = prov.get("detector_feedback")
+    if feedback is None:
+        return
+    if not isinstance(feedback, dict):
+        rep.error(rid, "provenance.detector_feedback must be an object")
+        return
+    for key in ("detector", "observed_verdict", "review_basis"):
+        if not nonempty(feedback.get(key)):
+            rep.error(rid, f"provenance.detector_feedback.{key} must be a non-empty string")
+    outcome = feedback.get("outcome")
+    if not isinstance(outcome, str) or outcome not in FEEDBACK_OUTCOMES:
+        rep.error(rid, f"provenance.detector_feedback.outcome must be one of {sorted(FEEDBACK_OUTCOMES)}")
+    try:
+        date.fromisoformat(feedback.get("observed_at") if isinstance(feedback.get("observed_at"), str) else "")
+    except ValueError:
+        rep.error(rid, "provenance.detector_feedback.observed_at must be an ISO calendar date (YYYY-MM-DD)")
+    if prov.get("kind") != "redacted-source":
+        rep.error(rid, "detector_feedback belongs on the real observed email (redacted-source); generated variants share its source_group instead")
+    label = (record.get("target") or {}).get("label") if isinstance(record.get("target"), dict) else None
+    expected = {"false_positive": "benign", "false_negative": "malicious"}.get(outcome)
+    if expected and label != expected and label in ("benign", "malicious"):
+        rep.error(rid, f"a {outcome} record must carry the reviewed label '{expected}', not the detector's verdict")
+    if not nonempty(record.get("source_group")):
+        rep.warn(rid, "detector_feedback record has no source_group; generated variants cannot be grouped with it for splitting")
+
+
+def check_record(rec, idx, labels, codes, rep, seen, strict=False, require_detailed=False, require_cn_context=False,
+                 require_grounding=False, require_raw_urls=False, require_render=False, as_of=None):
     if not isinstance(rec, dict):
         rep.error(f"#{idx}", "record is not a JSON object")
         return None
@@ -881,18 +1119,22 @@ def check_record(rec, idx, labels, codes, rep, seen, strict=False, require_detai
                 rep.error(rid, f"v2 {key} must be a non-empty string")
         if not isinstance(rec.get("domain"), str) or rec["domain"] not in DOMAINS:
             rep.error(rid, f"v2 domain must be one of {sorted(DOMAINS)}")
-    for key in ("pair_id", "scenario_type", "thread_family_id"):
+    for key in ("pair_id", "scenario_type", "thread_family_id", "source_group", "template_family_id"):
         if key in rec and not nonempty(rec[key]):
             rep.error(rid, f"{key} must be a non-empty string when present")
     if not nonempty(rec.get("scenario")):
         rep.error(rid, "scenario must be a non-empty string")
     prov = rec.get("provenance") if isinstance(rec.get("provenance"), dict) else {}
     kind = prov.get("kind")
+    if kind in ("source", "redacted-source"):
+        as_of = None  # Imported correspondence keeps its original timeline.
     allowed_kinds = {"synthetic", "redacted-source", "source-adapted"} if v2 else PROV_KINDS
     if not isinstance(kind, str) or kind not in allowed_kinds:
         rep.error(rid, f"provenance.kind must be one of {sorted(allowed_kinds)}")
     allowed_identifiers = check_provenance(prov, rid, rep) if v2 else []
-    check_grounding(rec, prov, rid, rep, require=require_grounding)
+    check_grounding(rec, prov, rid, rep, require=require_grounding, as_of=as_of)
+    check_render(rec, prov, rid, rep, require=require_render)
+    check_feedback(rec, prov, rid, rep)
     lang = rec.get("language")
     if not isinstance(lang, str) or lang not in LANGS:
         rep.error(rid, f"language must be one of {sorted(LANGS)}")
@@ -903,13 +1145,15 @@ def check_record(rec, idx, labels, codes, rep, seen, strict=False, require_detai
     inp = rec.get("input") if isinstance(rec.get("input"), dict) else {}
     if "business_context" in inp and not isinstance(inp["business_context"], str):
         rep.error(rid, "input.business_context must be a string")
-    cur, texts = check_message(inp.get("current_email"), rid, "input.current_email", rep, v2, True)
+    cur, texts = check_message(inp.get("current_email"), rid, "input.current_email", rep, v2, current=True,
+                               require_sent_at=require_render, as_of=as_of)
     hist = inp.get("history", [] if not v2 else None)
     if not isinstance(hist, list):
         rep.error(rid, "input.history must be a list")
         hist = []
     for i, history in enumerate(hist):
-        _, history_texts = check_message(history, rid, f"input.history[{i}]", rep, v2)
+        _, history_texts = check_message(history, rid, f"input.history[{i}]", rep, v2,
+                                         require_sent_at=require_render, as_of=as_of)
         texts += history_texts
     tgt = rec.get("target") if isinstance(rec.get("target"), dict) else {}
     label = tgt.get("label")
@@ -991,15 +1235,25 @@ def check_record(rec, idx, labels, codes, rep, seen, strict=False, require_detai
             rep.warn(rid, f"detailed current_email.body has {score} {metric}; exceeds twice recommended maximum {recommended_max}")
         if substantive["duplicate_paragraphs"]:
             rep.warn(rid, f"current_email.body repeats {substantive['duplicate_paragraphs']} nontrivial paragraph(s); duplicates did not count toward length")
+    sender_domain, sender_device = "", ""
+    render = rec.get("render")
+    if isinstance(render, dict) and isinstance(render.get("mailboxes"), dict) and isinstance(cur.get("from"), dict):
+        box = render["mailboxes"].get(text_value(cur["from"].get("address")).strip("[]"))
+        sender_domain = text_value(box.get("domain")) if isinstance(box, dict) else ""
+        people = render.get("people") if isinstance(render.get("people"), dict) else {}
+        person = people.get(box.get("owner")) if isinstance(box, dict) and isinstance(box.get("owner"), str) else None
+        if sender_domain:
+            sender_device = text_value(person.get("device")) or "desktop" if isinstance(person, dict) else "none"
     return {
         "id": rid, "label": text_value(label), "language": text_value(lang), "kind": text_value(kind),
         "difficulty": text_value(difficulty), "scenario_type": text_value(rec.get("scenario_type")),
         "pair_id": text_value(rec.get("pair_id")), "body_len": len(body),
         "has_history": bool(hist),
-        "has_redaction": bool(REDACTED_RE.search(json.dumps(inp, ensure_ascii=False)) or TOKEN_RE.search(json.dumps(inp, ensure_ascii=False))),
+        "has_redaction": bool(REDACTED_RE.search(json.dumps(inp, ensure_ascii=False)) or ANY_TOKEN_RE.search(json.dumps(inp, ensure_ascii=False))),
         "urgent": bool(URGENCY_RE.search(text_value(cur.get("subject")) + body)),
         "source_sensitive": sens if kind == "source" else 0,
         "content_profile": text_value(profile), "substantive_count": score, "substantive_metric": metric,
+        "sender_domain": sender_domain, "sender_device": sender_device,
         "_record": rec, "_input": inp, "_v2": v2,
         "_grounding_active": require_grounding or "grounding" in prov or kind == "source-adapted",
     }
@@ -1150,6 +1404,16 @@ def dataset_checks(rows, labels, balanced, rep):
         shares = {label: mean([row[key] for row in by_label[label]]) for label in present}
         if max(shares.values()) - min(shares.values()) > limit:
             rep.warn("dataset", f"share of {name} differs by label: " + ", ".join(f"{label}={share:.0%}" for label, share in shares.items()))
+    # Rendered sender relationships become visible features; both labels need overlap.
+    for field, name in (("sender_domain", "sender mailbox"), ("sender_device", "sender device")):
+        senders = {label: [row[field] for row in by_label[label] if row[field]] for label in present}
+        if not all(len(values) >= 5 for values in senders.values()):
+            continue
+        for kind in sorted(set().union(*senders.values())):
+            shares = {label: values.count(kind) / len(values) for label, values in senders.items()}
+            if max(shares.values()) - min(shares.values()) > 0.4:
+                rep.warn("dataset", f"current {name} '{kind}' share differs by label: "
+                         + ", ".join(f"{label}={share:.0%}" for label, share in shares.items()))
     return "leakage checks run"
 
 
@@ -1162,9 +1426,13 @@ def main():
     parser.add_argument("--require-cn-context", action="store_true", help="require mainland-China transaction and currency metadata")
     parser.add_argument("--require-grounding", action="store_true", help="require v2 source-adapted/redacted-source records with material-source mappings; does not verify source truth")
     parser.add_argument("--require-raw-urls", action="store_true", help="reject [URL_n] input placeholders; messages without links remain valid; never fetches URLs")
+    parser.add_argument("--require-render", action="store_true", help="require render declarations, sender/recipient mailboxes and sent_at for realistic rendering")
+    parser.add_argument("--require-current-year", action="store_true",
+                        help="require generated messages dated January 1 through today and a matching scenario year")
     parser.add_argument("--balanced", action="store_true", help="warn if labels deviate >10 points from equal share")
     parser.add_argument("--extra-codes", default="", help="comma-separated evidence codes to accept")
     args = parser.parse_args()
+    as_of = date.today() if args.require_current_year else None
     labels = [value.strip() for value in args.labels.split(",") if value.strip()]
     if not labels or len(set(labels)) != len(labels):
         parser.error("--labels must contain at least one label without duplicates")
@@ -1174,7 +1442,8 @@ def main():
     seen = set()
     rows = [row for row in (check_record(rec, i, set(labels), codes, rep, seen, strict=args.strict,
                                       require_detailed=args.require_detailed, require_cn_context=args.require_cn_context,
-                                      require_grounding=args.require_grounding, require_raw_urls=args.require_raw_urls)
+                                      require_grounding=args.require_grounding, require_raw_urls=args.require_raw_urls,
+                                      require_render=args.require_render, as_of=as_of)
                            for i, rec in enumerate(records, 1)) if row]
     leak_note = dataset_checks(rows, labels, args.balanced, rep)
     for line in rep.errors + rep.warnings:

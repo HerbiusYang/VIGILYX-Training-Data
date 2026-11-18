@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 import validate_records as validator
@@ -64,12 +65,14 @@ def legacy_fixture():
     return rec
 
 
-def check(records, strict=False, codes=None, require_detailed=False, require_cn_context=False, require_grounding=False, require_raw_urls=False):
+def check(records, strict=False, codes=None, require_detailed=False, require_cn_context=False, require_grounding=False,
+          require_raw_urls=False, require_render=False, as_of=None):
     rep, seen, rows = validator.Report(), set(), []
     for i, record in enumerate(records, 1):
         row = validator.check_record(record, i, LABELS, codes or validator.KNOWN_CODES, rep, seen, strict=strict,
                                      require_detailed=require_detailed, require_cn_context=require_cn_context,
-                                     require_grounding=require_grounding, require_raw_urls=require_raw_urls)
+                                     require_grounding=require_grounding, require_raw_urls=require_raw_urls,
+                                     require_render=require_render, as_of=as_of)
         if row:
             rows.append(row)
     validator.dataset_checks(rows, LABELS, False, rep)
@@ -158,6 +161,53 @@ def scenario_adapted_fixture():
 
 
 class ValidationTests(unittest.TestCase):
+    def test_current_year_checks_each_local_send_date(self):
+        batch_date = date(2032, 1, 2)
+        record = grounded_fixture()
+        messages = record["input"]["history"] + [record["input"]["current_email"]]
+        messages[0]["sent_at"] = "2032-01-01T00:15:00+14:00"
+        messages[1]["sent_at"] = "2032-01-02T12:00:00-08:00"
+        messages[1]["subject"] = "Review of the 2031 accounts"
+        record["provenance"]["grounding"]["context"]["period"] = "2032年1月核对2031年度账务"
+        self.assertEqual(check([record], as_of=batch_date).errors, [])
+        for index, stamp in ((0, "2031-12-31T23:59:00-08:00"), (1, "2032-01-03T00:00:00+08:00"),
+                             (1, "2033-01-01T00:00:00Z"), (0, None)):
+            with self.subTest(index=index, stamp=stamp):
+                original = messages[index].pop("sent_at")
+                if stamp is not None:
+                    messages[index]["sent_at"] = stamp
+                path = "input.history[0].sent_at" if index == 0 else "input.current_email.sent_at"
+                self.assertTrue(any(path in error for error in check([record], as_of=batch_date).errors))
+                messages[index]["sent_at"] = original
+
+    def test_current_year_checks_scenario_period_and_preserves_archived_dates(self):
+        batch_date = date(2026, 11, 11)
+        record = grounded_fixture()
+        for period in ("November 2025", "2025年11月发信，2026年查阅资料"):
+            record["provenance"]["grounding"]["context"]["period"] = period
+            self.assertTrue(any("context.period" in error for error in check([record], as_of=batch_date).errors))
+        self.assertEqual(check([record]).errors, [])
+        original = grounded_fixture("redacted-source")
+        self.assertEqual(check([original], as_of=date(2032, 1, 1)).errors, [])
+
+    def test_cli_current_year_uses_the_local_run_date(self):
+        today = date.today()
+        record = grounded_fixture()
+        for message in record["input"]["history"] + [record["input"]["current_email"]]:
+            message["sent_at"] = f"{today.year}-01-01T09:00:00+08:00"
+        record["provenance"]["grounding"]["context"]["period"] = str(today.year)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.json"
+            command = [sys.executable, str(Path(validator.__file__)), str(path), "--require-current-year"]
+            path.write_text(json.dumps([record]), encoding="utf-8")
+            good = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(good.returncode, 0, good.stdout + good.stderr)
+            record["input"]["current_email"]["sent_at"] = f"{today.year - 1}-12-31T12:00:00+08:00"
+            path.write_text(json.dumps([record]), encoding="utf-8")
+            bad = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
+            self.assertIn("input.current_email.sent_at", bad.stdout)
+
     def test_documented_material_based_scenario_adaptation_passes(self):
         record = scenario_adapted_fixture()
         self.assertEqual(check([record], require_grounding=True).errors, [])
@@ -881,6 +931,145 @@ class ValidationTests(unittest.TestCase):
             bad = subprocess.run(command, text=True, capture_output=True)
             self.assertEqual(bad.returncode, 1)
             self.assertIn("--require-raw-urls rejects", bad.stdout)
+
+
+def render_fixture():
+    """Fabricated record whose people and mailboxes are declared for rendering."""
+    record = fixture()[0]
+    for field in ("pair_id", "pair_type", "changed_paths"):
+        record.pop(field)
+    record["render"] = {
+        "orgs": {"ORG_1": {"kind": "fictional", "region": "浙江宁波", "industry": "家电零售"}},
+        "people": {"PERSON_1": {"org": "ORG_1", "dept": "Customer Service", "device": "mobile"}, "PERSON_2": {"gender": "f"}},
+        "mailboxes": {"EMAIL_1": {"owner": "PERSON_1", "domain": "org"},
+                      "EMAIL_2": {"owner": "PERSON_2", "domain": "freemail"}},
+    }
+    record["input"]["current_email"]["body"] += "\n\n[SIGNATURE_1]"
+    return record
+
+
+def feedback_fixture(label="benign"):
+    """Fabricated stand-in for a supplied real email that a detector misjudged."""
+    record = grounded_fixture("redacted-source")
+    source = record["provenance"]["sources"][0]
+    source.update(origin="user_supplied", title="Supplied original message", publisher="User-supplied mailbox export")
+    source.pop("url")
+    record["provenance"]["grounding"].pop("retrieval")
+    record["provenance"]["detector_feedback"] = {
+        "detector": "Vigilyx", "observed_verdict": "malicious", "observed_at": "2026-11-10",
+        "outcome": "false_positive", "review_basis": "Reviewer confirmed the refund matches the earlier approval."}
+    record["source_group"] = "fp_0001"
+    record["target"]["label"] = label
+    return record
+
+
+class RenderContractTests(unittest.TestCase):
+    def test_declared_render_profile_passes_require_render(self):
+        self.assertEqual(check([render_fixture()], require_render=True).errors, [])
+
+    def test_require_render_needs_profile_mailboxes_and_dates(self):
+        record = render_fixture()
+        record.pop("render")
+        self.assertTrue(any("requires a render object" in e for e in check([record], require_render=True).errors))
+        self.assertEqual(check([record]).errors, [])
+        record = render_fixture()
+        record["input"]["current_email"]["from"] = "Customer Service [PERSON_1]"
+        record["input"]["history"][0].pop("sent_at")
+        record["input"]["current_email"]["to"] = []
+        errors = "\n".join(check([record], require_render=True).errors)
+        for text in ("current_email.from must be an object", "history[0].sent_at is required", "to must list at least one"):
+            self.assertIn(text, errors)
+        record = render_fixture()
+        record["input"]["history"][0]["sent_at"] = "2026-11-12T09:00:00+00:00"
+        self.assertTrue(any("chronological" in e for e in check([record], require_render=True).errors))
+
+    def test_every_rendered_token_needs_a_declaration(self):
+        record = render_fixture()
+        record["input"]["current_email"]["body"] += " [ORG_2] [GIVEN_3] [USER_1]"
+        errors = "\n".join(check([record]).errors)
+        self.assertIn("does not declare ORG_2", errors)
+        self.assertIn("does not declare PERSON_3", errors)
+        self.assertNotIn("USER_1", errors)
+
+    def test_fictional_and_real_organization_rules(self):
+        record = render_fixture()
+        record["render"]["orgs"]["ORG_1"]["name"] = "Invented Trading Co."
+        self.assertTrue(any("fictional organizations get names" in e for e in check([record]).errors))
+        record = render_fixture()
+        record["render"]["orgs"]["ORG_1"] = {"kind": "real", "name": "Unlisted Bank", "source_ids": ["src_refund"]}
+        errors = "\n".join(check([record]).errors)
+        self.assertIn("must exactly match a provenance.entities name", errors)
+        self.assertIn("needs that organization's sourced domain", errors)
+        record["render"]["orgs"]["ORG_1"] = {"kind": "real", "name": "Test Store", "domain": "store.example",
+                                             "source_ids": ["src_refund"]}
+        self.assertEqual(check([record]).errors, [])
+        record["render"]["mailboxes"]["EMAIL_1"]["domain"] = "lookalike"
+        record["input"]["current_email"]["body"] += " https://[LOOKALIKE_1]/login"
+        errors = "\n".join(check([record]).errors)
+        self.assertIn("sourced indicator value, never generated", errors)
+        self.assertIn("cannot be generated for a real organization", errors)
+
+    def test_mailbox_owner_value_and_local_rules(self):
+        record = render_fixture()
+        boxes = record["render"]["mailboxes"]
+        boxes["EMAIL_3"] = {"owner": "PERSON_9", "domain": "observed"}
+        boxes["EMAIL_4"] = {"owner": "ORG_1", "domain": "external", "value": "Notice-Center.top", "local": "HR Dept"}
+        errors = "\n".join(check([record]).errors)
+        for text in ("EMAIL_3.owner must reference", "observed mailboxes require", "EMAIL_4.value must be a lowercase hostname",
+                     "EMAIL_4.source_ids must reference", "EMAIL_4.local must be"):
+            self.assertIn(text, errors)
+        boxes["EMAIL_3"] = {"owner": "PERSON_2", "domain": "observed", "value": "notice-center.top", "source_ids": ["src_refund"]}
+        boxes["EMAIL_4"] = {"owner": "ORG_1", "domain": "external", "local": "hr"}
+        self.assertEqual(check([record]).errors, [])
+
+    def test_render_tokens_do_not_count_as_english(self):
+        record = cn_record(body="[SURNAME_1]工、[SURNAME_2]经理、[GIVEN_3]，您好：[ORGSHORT_1]和[ORGSHORT_2]的发票[INVOICE_1]、[INVOICE_2]已经开好，合同[CONTRACT_1]，工单[TICKET_1]，请在[DOMAIN_1]核对后回复。\n\n[SIGNATURE_2]")
+        record["input"]["history"][0].update(subject="退款已审批", body="您的退款已经审批，将退回原支付方式。")
+        record["input"]["current_email"]["subject"] = "[ORGSHORT_1]发票核对"
+        self.assertFalse(any("English" in w for w in check([record]).warnings))
+
+    def test_user_supplied_original_needs_no_url_or_search_log(self):
+        record = feedback_fixture()
+        record["provenance"].pop("detector_feedback")
+        self.assertEqual(check([record], require_grounding=True).errors, [])
+        record["provenance"]["sources"].append({"id": "src_web", "title": "Web page", "publisher": "Test", "url": "https://example.com/a",
+                                                "accessed_at": "2026-11-11", "supports": "Context", "roles": ["context"]})
+        self.assertTrue(any("retrieval must be an object" in e for e in check([record], require_grounding=True).errors))
+        record["provenance"]["sources"][1].pop("url")
+        self.assertTrue(any("sources[1].url must be" in e for e in check([record], require_grounding=True).errors))
+
+    def test_detector_feedback_keeps_reviewed_label_and_real_source(self):
+        self.assertEqual(check([feedback_fixture()], require_grounding=True).errors, [])
+        errors = "\n".join(check([feedback_fixture("malicious")]).errors)
+        self.assertIn("must carry the reviewed label 'benign'", errors)
+        record = feedback_fixture()
+        record.pop("source_group")
+        record["provenance"]["detector_feedback"]["outcome"] = "missed"
+        rep = check([record])
+        self.assertTrue(any("outcome must be one of" in e for e in rep.errors))
+        self.assertTrue(any("no source_group" in w for w in rep.warnings))
+        record = scenario_adapted_fixture()
+        record["provenance"]["detector_feedback"] = feedback_fixture()["provenance"]["detector_feedback"]
+        self.assertTrue(any("belongs on the real observed email" in e for e in check([record]).errors))
+
+    def test_sender_mailbox_skew_between_labels_warns(self):
+        records = []
+        for i in range(10):
+            record = render_fixture()
+            record["id"] = f"r_skew{i:02d}"
+            record["input"]["current_email"]["body"] = f"Please pay a separate processing fee for case {i}."
+            if i >= 5:
+                record["target"]["label"] = "benign"
+                record["target"]["evidence"][0]["code"] = "process_consistent"
+            else:
+                record["render"]["mailboxes"]["EMAIL_1"]["domain"] = "freemail"
+            records.append(record)
+        warnings = check(records).warnings
+        self.assertTrue(any("sender mailbox 'freemail' share differs" in w for w in warnings))
+        self.assertFalse(any("sender device" in w for w in warnings))
+        for record in records[5:]:
+            record["render"]["people"]["PERSON_1"]["device"] = "desktop"
+        self.assertTrue(any("sender device 'mobile' share differs" in w for w in check(records).warnings))
 
 
 if __name__ == "__main__":
